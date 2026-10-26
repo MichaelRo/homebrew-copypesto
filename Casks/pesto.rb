@@ -2,8 +2,7 @@ cask "pesto" do
   version "1.0.1"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
-  url "https://github.com/MichaelRo/copypesto/releases/download/v#{version}/Pesto-#{version}.dmg",
-      verified: "github.com/MichaelRo/copypesto/"
+  url "https://github.com/MichaelRo/copypesto/releases/download/v#{version}/Pesto-#{version}.dmg"
   name "Pesto"
   desc "Local, encrypted clipboard manager"
   homepage "https://copypesto.net/"
