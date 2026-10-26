@@ -1,0 +1,90 @@
+name: tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  cask:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      EXPECTED_TEAM_ID: ${{ vars.PESTO_TEAM_ID }}
+    steps:
+      - name: Check out the tap
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Link the checkout as the tap
+        run: |
+          mkdir -p "$(brew --repo)/Library/Taps/michaelro"
+          ln -s "$GITHUB_WORKSPACE" "$(brew --repo)/Library/Taps/michaelro/homebrew-copypesto"
+
+      - name: House rules
+        run: |
+          [ "$(ls Casks)" = "pesto.rb" ] || { echo "::error::Casks/ must hold exactly pesto.rb."; exit 1; }
+          if grep -Eq 'sha256 "0{64}"|PLACEHOLDER' Casks/pesto.rb; then
+            echo "::error::Casks/pesto.rb still has the placeholder SHA-256."; exit 1
+          fi
+          ver="$(sed -n 's/^  version "\(.*\)"$/\1/p' Casks/pesto.rb)"
+          lowest="$(printf '%s\n%s\n' 1.0.1 "$ver" | sort -V | head -n 1)"
+          [ "$lowest" = "1.0.1" ] || { echo "::error::Version $ver is older than 1.0.1, the first notarized release."; exit 1; }
+          if grep -q 'io\.pesto\.app' Casks/pesto.rb; then
+            echo "::error::zap must name net.copypesto.pesto paths only."; exit 1
+          fi
+          [ "$(grep -c 'net\.copypesto\.pesto' Casks/pesto.rb)" -ge 6 ] || { echo "::error::zap list looks short."; exit 1; }
+          test -n "$EXPECTED_TEAM_ID" || { echo "::error::Repository variable PESTO_TEAM_ID is empty."; exit 1; }
+
+      - name: Style
+        run: brew style michaelro/copypesto
+
+      - name: Audit
+        run: brew audit --cask --strict --online --signing michaelro/copypesto/pesto
+
+      - name: Audit as a new cask (informational)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git diff --diff-filter=A --name-only "$BASE"...HEAD -- Casks/pesto.rb | grep -q .; then
+            brew audit --cask --new michaelro/copypesto/pesto
+          else
+            echo "Casks/pesto.rb is not new in this pull request. Skipping."
+          fi
+
+      - name: Livecheck
+        run: brew livecheck --cask michaelro/copypesto/pesto
+
+      - name: Install
+        run: |
+          brew install --cask michaelro/copypesto/pesto
+          test -d /Applications/Pesto.app
+          app=/Applications/Pesto.app
+          team="$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+          [ "$team" = "$EXPECTED_TEAM_ID" ] || { echo "::error::Installed app Team ID is '$team', expected '$EXPECTED_TEAM_ID'."; exit 1; }
+          spctl -a -t exec -vv "$app"
+          xcrun stapler validate "$app"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "net.copypesto.pesto" ]
+
+      - name: Uninstall and zap
+        run: |
+          brew uninstall --cask --zap michaelro/copypesto/pesto
+          test ! -e /Applications/Pesto.app

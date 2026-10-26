@@ -1,0 +1,245 @@
+name: bump
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  repository_dispatch:
+    types: [bump-cask]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Verify and print the SHA-256; open no pull request"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: bump-pesto
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bump:
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write        # push the bump branch
+      pull-requests: write   # open the pull request
+      actions: write         # dispatch tests.yml on the bump branch (GITHUB_TOKEN pushes do not trigger it)
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      EXPECTED_TEAM_ID: ${{ vars.PESTO_TEAM_ID }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      MIN_VERSION: "1.0.1"
+      BUNDLE_ID: net.copypesto.pesto
+      APPCAST_URL: https://copypesto.net/appcast.xml
+    steps:
+      - name: Check out the tap
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Link the checkout as the tap
+        run: |
+          mkdir -p "$(brew --repo)/Library/Taps/michaelro"
+          ln -s "$GITHUB_WORKSPACE" "$(brew --repo)/Library/Taps/michaelro/homebrew-copypesto"
+          mkdir -p "$RUNNER_TEMP/work"
+          test -f Casks/pesto.rb || { echo "::error::Casks/pesto.rb is missing. Add the first version by hand (see README, 'First release')."; exit 1; }
+          test -n "$EXPECTED_TEAM_ID" || { echo "::error::Repository variable PESTO_TEAM_ID is empty."; exit 1; }
+          [[ "$EXPECTED_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "::error::PESTO_TEAM_ID is not 10 letters and digits."; exit 1; }
+
+      - name: Read the appcast
+        id: appcast
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 30 \
+            --output "$RUNNER_TEMP/work/appcast.xml" "$APPCAST_URL"
+          python3 -I - "$RUNNER_TEMP/work/appcast.xml" >> "$GITHUB_OUTPUT" <<'PY'
+          import re, sys
+          import xml.etree.ElementTree as ET
+          S = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+          items = ET.parse(sys.argv[1]).getroot().findall("./channel/item")
+          if not items:
+              sys.exit("appcast has no items")
+          best = max(items, key=lambda i: int(i.findtext(S + "version")))
+          version = best.findtext(S + "shortVersionString")
+          enc = best.find("enclosure")
+          url, length = enc.get("url"), enc.get("length")
+          min_os = best.findtext(S + "minimumSystemVersion")
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version or ""):
+              sys.exit(f"unexpected version {version!r}")
+          expected = f"https://github.com/MichaelRo/copypesto/releases/download/v{version}/Pesto-{version}.dmg"
+          if url != expected:
+              sys.exit(f"enclosure url {url!r} is not {expected!r}")
+          if not re.fullmatch(r"\d+", length or ""):
+              sys.exit(f"unexpected length {length!r}")
+          if min_os != "15.0":
+              sys.exit(f"minimumSystemVersion is {min_os!r}; the cask says :sequoia (15.0). Update both together.")
+          print(f"version={version}")
+          print(f"url={url}")
+          print(f"length={length}")
+          PY
+
+      - name: Decide whether to bump
+        id: plan
+        env:
+          LATEST: ${{ steps.appcast.outputs.version }}
+        run: |
+          current="$(sed -n 's/^  version "\(.*\)"$/\1/p' Casks/pesto.rb)"
+          [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Cannot read version from Casks/pesto.rb"; exit 1; }
+          newest="$(printf '%s\n%s\n' "$current" "$LATEST" | sort -V | tail -n 1)"
+          if [ "$LATEST" = "$current" ] && [ "$DRY_RUN" != "true" ]; then
+            echo "pesto is at $current. Nothing to do."; echo "bump=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$newest" != "$LATEST" ]; then
+            echo "::error::The appcast offers $LATEST, older than the cask's $current."; exit 1
+          fi
+          lowest="$(printf '%s\n%s\n' "$MIN_VERSION" "$LATEST" | sort -V | head -n 1)"
+          if [ "$lowest" != "$MIN_VERSION" ]; then
+            echo "::notice::Appcast version $LATEST is below $MIN_VERSION (the first notarized release). Skipping."
+            echo "bump=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "bump=true" >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+
+      - name: Download the disk image and check its hash
+        id: dmg
+        if: steps.plan.outputs.bump == 'true'
+        env:
+          VERSION: ${{ steps.appcast.outputs.version }}
+          URL: ${{ steps.appcast.outputs.url }}
+          LENGTH: ${{ steps.appcast.outputs.length }}
+        run: |
+          cd "$RUNNER_TEMP/work"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 600 -o "Pesto-$VERSION.dmg" "$URL"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 60 -o "Pesto-$VERSION.dmg.sha256" "$URL.sha256"
+          actual="$(shasum -a 256 "Pesto-$VERSION.dmg" | awk '{print $1}')"
+          published="$(awk 'NR==1 {print $1}' "Pesto-$VERSION.dmg.sha256")"
+          size="$(stat -f %z "Pesto-$VERSION.dmg")"
+          [[ "$published" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::The .sha256 asset does not start with a SHA-256."; exit 1; }
+          if [ "$actual" != "$published" ]; then
+            echo "::error::SHA-256 mismatch. Downloaded $actual, release publishes $published. No change made."; exit 1
+          fi
+          if [ "$size" != "$LENGTH" ]; then
+            echo "::error::Size mismatch. Downloaded $size bytes, appcast says $LENGTH. No change made."; exit 1
+          fi
+          echo "sha256=$actual" >> "$GITHUB_OUTPUT"
+
+      - name: Verify signing and notarization
+        if: steps.plan.outputs.bump == 'true'
+        env:
+          VERSION: ${{ steps.appcast.outputs.version }}
+        run: |
+          cd "$RUNNER_TEMP/work"
+          dmg="Pesto-$VERSION.dmg"
+          mnt="$RUNNER_TEMP/work/mnt"
+          trap 'hdiutil detach "$mnt" -quiet -force || true' EXIT
+
+          echo "== disk image =="
+          codesign --verify --strict --verbose=2 "$dmg"
+          spctl -a -t open --context context:primary-signature -vv "$dmg"
+          xcrun stapler validate "$dmg"
+
+          mkdir -p "$mnt"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt" -quiet
+          test -d "$mnt/Pesto.app" || { echo "::error::Pesto.app is not at the volume root."; exit 1; }
+          ditto "$mnt/Pesto.app" "$RUNNER_TEMP/work/Pesto.app"
+          app="$RUNNER_TEMP/work/Pesto.app"
+
+          echo "== app =="
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl -a -t exec -vv "$app"
+          xcrun stapler validate "$app"
+
+          info="$(codesign -dv --verbose=4 "$app" 2>&1)"
+          team="$(printf '%s\n' "$info" | sed -n 's/^TeamIdentifier=//p')"
+          printf '%s\n' "$info" | grep -q '^Authority=Developer ID Application:' \
+            || { echo "::error::Not signed with a Developer ID Application certificate."; exit 1; }
+          printf '%s\n' "$info" | grep -Eq 'flags=0x[0-9a-f]+\(.*runtime.*\)' \
+            || { echo "::error::Hardened runtime is not enabled."; exit 1; }
+          if [ "$team" != "$EXPECTED_TEAM_ID" ]; then
+            echo "::error::Team ID is '$team', expected '$EXPECTED_TEAM_ID'. Not bumping."; exit 1
+          fi
+
+          plist="$app/Contents/Info.plist"
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist"; }
+          [ "$(pb CFBundleIdentifier)" = "$BUNDLE_ID" ]       || { echo "::error::Bundle ID differs."; exit 1; }
+          [ "$(pb CFBundleShortVersionString)" = "$VERSION" ] || { echo "::error::Bundle version differs from the appcast."; exit 1; }
+          [ "$(pb LSMinimumSystemVersion)" = "15.0" ]         || { echo "::error::LSMinimumSystemVersion is not 15.0."; exit 1; }
+          [ "$(pb LSUIElement)" = "true" ]                    || { echo "::error::LSUIElement is not true."; exit 1; }
+          [ "$(pb SUFeedURL)" = "$APPCAST_URL" ]              || { echo "::error::SUFeedURL is not the appcast."; exit 1; }
+          echo "Verified: Team ID $team, bundle $BUNDLE_ID $VERSION."
+
+      - name: Report (dry run)
+        if: steps.plan.outputs.bump == 'true' && env.DRY_RUN == 'true'
+        env:
+          VERSION: ${{ steps.appcast.outputs.version }}
+          SHA: ${{ steps.dmg.outputs.sha256 }}
+        run: |
+          {
+            echo "### Dry run: pesto $VERSION"
+            echo
+            echo "SHA-256: \`$SHA\`"
+            echo
+            echo "All signing, notarization and Team ID checks passed. No branch or pull request was created."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rewrite the cask
+        if: steps.plan.outputs.bump == 'true' && env.DRY_RUN != 'true'
+        env:
+          VERSION: ${{ steps.appcast.outputs.version }}
+          SHA: ${{ steps.dmg.outputs.sha256 }}
+        run: |
+          [ "$(grep -c '^  version "' Casks/pesto.rb)" = 1 ] && [ "$(grep -c '^  sha256 "' Casks/pesto.rb)" = 1 ] \
+            || { echo "::error::Expected exactly one version and one sha256 line."; exit 1; }
+          sed -i '' -E "s/^(  version )\".*\"$/\1\"$VERSION\"/; s/^(  sha256 )\".*\"$/\1\"$SHA\"/" Casks/pesto.rb
+          [ "$(git diff --numstat -- Casks/pesto.rb | awk '{print $1 "/" $2}')" = "2/2" ] \
+            || { echo "::error::The rewrite changed more than the two lines."; git diff; exit 1; }
+          git diff -- Casks/pesto.rb
+
+      - name: Style, audit, install, uninstall
+        if: steps.plan.outputs.bump == 'true' && env.DRY_RUN != 'true'
+        run: |
+          brew style --cask michaelro/copypesto/pesto
+          brew audit --cask --strict --online --signing michaelro/copypesto/pesto
+          brew livecheck --cask michaelro/copypesto/pesto
+          brew install --cask michaelro/copypesto/pesto
+          test -d /Applications/Pesto.app
+          brew uninstall --cask --zap michaelro/copypesto/pesto
+          test ! -e /Applications/Pesto.app
+
+      - name: Open the pull request
+        if: steps.plan.outputs.bump == 'true' && env.DRY_RUN != 'true'
+        env:
+          VERSION: ${{ steps.appcast.outputs.version }}
+          SHA: ${{ steps.dmg.outputs.sha256 }}
+          CURRENT: ${{ steps.plan.outputs.current }}
+        run: |
+          branch="bump/pesto-$VERSION"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::notice::Branch $branch already exists. Close it and delete the branch to retry."; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add Casks/pesto.rb
+          git commit -m "pesto $VERSION"
+          git push origin "$branch"
+          cat > "$RUNNER_TEMP/body.md" <<BODY
+          Bump pesto from $CURRENT to $VERSION.
+
+          - SHA-256 \`$SHA\` matches the \`.sha256\` asset on the release.
+          - Size matches the appcast.
+          - \`codesign --verify --deep --strict\`, \`spctl -a -t exec -vv\` and \`stapler validate\` pass on the app and the disk image.
+          - Team ID matches the repository variable \`PESTO_TEAM_ID\`.
+          - \`brew style\`, \`brew audit --cask --strict --online --signing\`, install and uninstall --zap pass.
+
+          Release: https://github.com/MichaelRo/copypesto/releases/tag/v$VERSION
+          BODY
+          gh pr create --base main --head "$branch" --title "pesto $VERSION" --body-file "$RUNNER_TEMP/body.md"
+          gh workflow run tests.yml --ref "$branch"
