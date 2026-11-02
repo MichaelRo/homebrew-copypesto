@@ -49,6 +49,7 @@ jobs:
         run: |
           mkdir -p "$(brew --repo)/Library/Taps/michaelro"
           ln -s "$GITHUB_WORKSPACE" "$(brew --repo)/Library/Taps/michaelro/homebrew-copypesto"
+          brew trust michaelro/copypesto 2>/dev/null || true
           mkdir -p "$RUNNER_TEMP/work"
           test -f Casks/pesto.rb || { echo "::error::Casks/pesto.rb is missing. Add the first version by hand (see README, 'First release')."; exit 1; }
           test -n "$EXPECTED_TEAM_ID" || { echo "::error::Repository variable PESTO_TEAM_ID is empty."; exit 1; }

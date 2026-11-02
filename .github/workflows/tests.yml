@@ -36,6 +36,7 @@ jobs:
         run: |
           mkdir -p "$(brew --repo)/Library/Taps/michaelro"
           ln -s "$GITHUB_WORKSPACE" "$(brew --repo)/Library/Taps/michaelro/homebrew-copypesto"
+          brew trust michaelro/copypesto 2>/dev/null || true
 
       - name: House rules
         run: |
