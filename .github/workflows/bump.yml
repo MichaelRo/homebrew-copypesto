@@ -49,6 +49,7 @@ jobs:
         run: |
           mkdir -p "$(brew --repo)/Library/Taps/michaelro"
           ln -s "$GITHUB_WORKSPACE" "$(brew --repo)/Library/Taps/michaelro/homebrew-copypesto"
+          brew trust michaelro/copypesto 2>/dev/null || true
           mkdir -p "$RUNNER_TEMP/work"
           test -f Casks/pesto.rb || { echo "::error::Casks/pesto.rb is missing. Add the first version by hand (see README, 'First release')."; exit 1; }
           test -n "$EXPECTED_TEAM_ID" || { echo "::error::Repository variable PESTO_TEAM_ID is empty."; exit 1; }
@@ -206,7 +207,7 @@ jobs:
         if: steps.plan.outputs.bump == 'true' && env.DRY_RUN != 'true'
         run: |
           brew style --cask michaelro/copypesto/pesto
-          brew audit --cask --strict --online --signing michaelro/copypesto/pesto
+          brew audit --cask --strict --online michaelro/copypesto/pesto
           brew livecheck --cask michaelro/copypesto/pesto
           brew install --cask michaelro/copypesto/pesto
           test -d /Applications/Pesto.app
@@ -237,7 +238,7 @@ jobs:
           - Size matches the appcast.
           - \`codesign --verify --deep --strict\`, \`spctl -a -t exec -vv\` and \`stapler validate\` pass on the app and the disk image.
           - Team ID matches the repository variable \`PESTO_TEAM_ID\`.
-          - \`brew style\`, \`brew audit --cask --strict --online --signing\`, install and uninstall --zap pass.
+          - \`brew style\`, \`brew audit --cask --strict --online\`, install and uninstall --zap pass.
 
           Release: https://github.com/MichaelRo/copypesto/releases/tag/v$VERSION
           BODY
