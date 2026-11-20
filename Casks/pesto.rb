@@ -1,6 +1,6 @@
 cask "pesto" do
-  version "1.7.0"
-  sha256 "93979ebee3a3df1b3f5e8b3e52820b17333907cb51707dba97991f4dd8adcc22"
+  version "1.8.0"
+  sha256 "92625cb07dae8efb8606be94551f7bdef197804208ea964c0347d1adb7a243e5"
 
   url "https://github.com/MichaelRo/copypesto/releases/download/v#{version}/Pesto-#{version}.dmg"
   name "Pesto"
